@@ -1,0 +1,380 @@
+name: Build vetted T3 Code
+run-name: Build ${{ inputs.tag || 'vetted head' }}
+
+# Builds an audited/* tag of the private vetted fork and publishes one release
+# here. Upstream workflows never run: this repository holds only this file, and
+# Actions stay disabled on the fork.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "audited/<sha12> tag to build. Empty builds the audited head of `vetted`."
+        required: false
+        type: string
+      force:
+        description: "Rebuild and replace the release if this commit was already built."
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: build-${{ inputs.tag || 'head' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: petervas8/t3code-vetted
+
+jobs:
+  resolve:
+    name: Resolve audited commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      tag: ${{ steps.r.outputs.tag }}
+      version: ${{ steps.r.outputs.version }}
+      release_tag: ${{ steps.r.outputs.release_tag }}
+      skip: ${{ steps.r.outputs.skip }}
+    steps:
+      - id: r
+        env:
+          TOKEN: ${{ secrets.VETTED_REPO_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TOKEN" ]]; then
+            echo "::error::Add the VETTED_REPO_TOKEN secret (read access to $SOURCE_REPO). See README.md."
+            exit 1
+          fi
+          refs="$(git ls-remote "https://x-access-token:${TOKEN}@github.com/${SOURCE_REPO}.git" refs/heads/vetted 'refs/tags/audited/*')"
+
+          # vet.sh makes annotated tags, so each one has a peeled ^{} line naming its commit.
+          if [[ -n "$INPUT_TAG" ]]; then
+            tag="${INPUT_TAG#refs/tags/}"
+            [[ "$tag" == audited/* ]] || { echo "::error::$tag is not an audited/* tag"; exit 1; }
+            sha="$(awk -v r="refs/tags/${tag}^{}" '$2 == r { print $1 }' <<<"$refs")"
+            [[ -n "$sha" ]] || { echo "::error::No annotated tag $tag in $SOURCE_REPO"; exit 1; }
+          else
+            sha="$(awk '$2 == "refs/heads/vetted" { print $1 }' <<<"$refs")"
+            tag="$(awk -v h="$sha" '$1 == h && $2 ~ /^refs\/tags\/audited\/.*\^\{\}$/ { sub(/^refs\/tags\//, "", $2); sub(/\^\{\}$/, "", $2); print $2; exit }' <<<"$refs")"
+            if [[ -z "$tag" ]]; then
+              echo "::error::vetted head ${sha:0:12} carries no audited/* tag. Run vet.sh approve or vet.sh retag first."
+              exit 1
+            fi
+          fi
+
+          base="$(curl -fsSL -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${SOURCE_REPO}/contents/apps/server/package.json?ref=${sha}" | jq -r .version)"
+          version="${base}-vetted.${GITHUB_RUN_NUMBER}"
+          release_tag="vetted-${sha:0:12}"
+
+          skip=false
+          if gh release view "$release_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [[ "$FORCE" != true ]]; then
+            echo "::notice::$release_tag is already released. Run with force to rebuild."
+            skip=true
+          fi
+
+          {
+            echo "sha=$sha"; echo "tag=$tag"; echo "version=$version"
+            echo "release_tag=$release_tag"; echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $tag ($sha) as $version" >> "$GITHUB_STEP_SUMMARY"
+
+  # Server bundle, web client and Electron main. Platform independent, so the
+  # desktop jobs share it.
+  bundle:
+    name: JS bundle
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      T3CODE_TELEMETRY_CHANNEL: dev
+    steps:
+      - &checkout
+        name: Checkout audited source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          token: ${{ secrets.VETTED_REPO_TOKEN }}
+          persist-credentials: false
+          # Vendored references are never reviewed, so they never reach the build.
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - run: vp run build:desktop:bundle
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  linux:
+    name: Linux x64 desktop + server
+    needs: [resolve, bundle]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      T3CODE_TELEMETRY_CHANNEL: dev
+    steps:
+      - *checkout
+
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - &download_bundle
+        name: Download JS bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: js-bundle
+          path: apps
+
+      - name: Install build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev pkg-config libgtk-3-0t64 libnss3 libasound2t64 libgbm1 imagemagick patchelf
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build resource monitor
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
+
+      # The desktop build brands its own copy; the server archive ships this one.
+      - run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
+
+      - name: Build server executable
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Build server archive
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/cli-resource-monitor/linux-x64"
+          mkdir -p "$dir"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$dir/"
+          node scripts/build-cli-archive.ts \
+            --platform linux --arch x64 --version "$VERSION" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
+            --output-dir release-cli
+
+      - name: Smoke-test server archive
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$VERSION"
+
+      # AppImage also produces the .deb.
+      - name: Build desktop app
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+        run: vp run dist:desktop:artifact --platform linux --target AppImage --arch x64 --build-version "$VERSION" --skip-build --verbose
+
+      - &collect
+        name: Collect assets
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p out
+          for f in release/*.dmg release/*.zip release/*.AppImage release/*.deb release/*.blockmap release/*.yml release-cli/*; do
+            [[ "$f" == *builder-debug.yml ]] || cp "$f" out/
+          done
+          ls -la out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: assets-linux-x64
+          path: out/*
+          if-no-files-found: error
+          compression-level: 0
+
+  macos:
+    name: macOS arm64 desktop
+    needs: [resolve, bundle]
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      T3CODE_TELEMETRY_CHANNEL: dev
+    steps:
+      - *checkout
+
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - *download_bundle
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Build resource monitor
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target aarch64-apple-darwin
+
+      # No Apple secrets, so the app is signed ad hoc and not notarized.
+      - name: Build desktop app
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+        run: vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --build-version "$VERSION" --skip-build --verbose
+
+      - *collect
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: assets-mac-arm64
+          path: out/*
+          if-no-files-found: error
+          compression-level: 0
+
+  android:
+    name: Android APK (unsigned)
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - *checkout
+
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/mobile...
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: gradle-
+
+      # Updates off: the app would otherwise pull unvetted JS from upstream's
+      # Expo project over the air on every launch.
+      - name: Generate native project
+        working-directory: apps/mobile
+        env:
+          APP_VARIANT: production
+          T3CODE_MOBILE_UPDATES_ENABLED: "0"
+          EXPO_NO_GIT_STATUS: "1"
+        run: ./node_modules/.bin/expo prebuild --clean --platform android
+
+      - name: Build APK
+        working-directory: apps/mobile/android
+        env:
+          APP_VARIANT: production
+          T3CODE_MOBILE_UPDATES_ENABLED: "0"
+          NODE_ENV: production
+        run: ./gradlew app:assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: android-unsigned
+          path: apps/mobile/android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  # Signs in a job that runs none of the audited code, so the keystore never
+  # shares a runner with build scripts.
+  android_sign:
+    name: Sign Android APK
+    needs: [resolve, android]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: android-unsigned
+          path: in
+
+      - name: Sign
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$KEYSTORE" || -z "$KEY_ALIAS" || -z "$ANDROID_KEYSTORE_PASSWORD" ]]; then
+            echo "::error::Add the ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS and ANDROID_KEYSTORE_PASSWORD secrets. See README.md."
+            exit 1
+          fi
+          : "${ANDROID_KEY_PASSWORD:=$ANDROID_KEYSTORE_PASSWORD}"
+          export ANDROID_KEY_PASSWORD
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n 1)apksigner"
+          ks="$RUNNER_TEMP/release.jks"
+          (umask 077 && printf '%s' "$KEYSTORE" | base64 --decode > "$ks")
+          trap 'rm -f "$ks"' EXIT
+          mkdir -p out
+          "$apksigner" sign --ks "$ks" --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEY_PASSWORD \
+            --out "out/T3-Code-${VERSION}-android-arm64.apk" in/app-release.apk
+          "$apksigner" verify --print-certs "out/T3-Code-${VERSION}-android-arm64.apk"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: assets-android
+          path: out/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish release
+    needs: [resolve, linux, macos, android_sign]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: assets-*
+          path: assets
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          AUDITED_TAG: ${{ needs.resolve.outputs.tag }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          (cd assets && sha256sum * > SHA256SUMS)
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          gh release create "$RELEASE_TAG" assets/* -R "$GITHUB_REPOSITORY" \
+            --title "T3 Code $VERSION" \
+            --notes "Built from \`$AUDITED_TAG\` ($SHA) of $SOURCE_REPO."
