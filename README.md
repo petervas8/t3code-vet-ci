@@ -14,7 +14,7 @@ Each run builds one `audited/*` tag and publishes a release named `vetted-<sha12
 
 ## One-time setup
 
-1. Create the repository (private) and push this one: `gh repo create petervas8/t3code-vet-ci --private --source . --push`.
+1. Create the repository (public) and push this one: `gh repo create petervas8/t3code-vet-ci --public --source . --push`. The workflow only starts by hand (`workflow_dispatch`), so pull requests from forks never run it or see its secrets.
 2. Make a fine-grained token with **Contents: read** on `petervas8/t3code-vetted` only, and store it: `gh secret set VETTED_REPO_TOKEN -R petervas8/t3code-vet-ci`.
 3. Make an Android signing key once and keep a backup. Android only installs an update signed by the same key.
    ```bash
@@ -46,11 +46,11 @@ A run fails at the start if the head of `vetted` has no `audited/*` tag. It skip
 ## Things that still reach upstream
 
 - **`t3 update`, and Update server in the mobile app**, install upstream's unvetted release from `pingdotgg/t3code`. Don't use them. Install the next build from here instead.
-- **Desktop auto-update** looks for releases in this repository, which is private, so its checks fail. Set `T3CODE_DISABLE_AUTO_UPDATE=1`.
+- **Desktop auto-update** follows releases in this repository, not upstream, so it only installs vetted builds. The Linux AppImage updates itself. macOS can't install updates into an app that isn't signed with a Developer ID, so download new DMGs by hand.
 - **Over-the-air mobile updates** are turned off at build time (`T3CODE_MOBILE_UPDATES_ENABLED=0`). Without that, the APK would download JS from upstream's Expo project on every launch.
 - **Telemetry** can only be turned off at runtime: `T3CODE_TELEMETRY_ENABLED=false`.
 - **T3 Connect** sign-in is not built in, because its Clerk and relay settings come from upstream's own deploy. Connect over LAN or Tailscale instead.
 
-## Cost
+## Visibility
 
-Private repositories pay for runner minutes, and macOS minutes count 10×. One full run uses about 20 macOS minutes (≈200 billed minutes) plus about 60 Linux minutes. On GitHub Free's 2,000 minutes a month that is roughly 7 builds. Approve in larger steps, or make this repository public: the source is open anyway, and public repos run for free.
+This repository is public, so its releases, workflow logs and the audited commit SHAs are public too. Standard runners are free for public repositories, macOS included. The source stays in the private fork; only the built apps are published here.
