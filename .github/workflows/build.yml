@@ -98,19 +98,23 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       T3CODE_TELEMETRY_CHANNEL: dev
     steps:
+      # Plain git, not actions/checkout: its credential cleanup runs a submodule
+      # foreach that fails on the orphaned gitlinks under .repos/. The token is
+      # only on this fetch's command line and never lands in git config.
       - &checkout
         name: Checkout audited source
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ needs.resolve.outputs.sha }}
-          token: ${{ secrets.VETTED_REPO_TOKEN }}
-          persist-credentials: false
+        env:
+          TOKEN: ${{ secrets.VETTED_REPO_TOKEN }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init -q .
+          git fetch -q --no-tags --depth=1 "https://x-access-token:${TOKEN}@github.com/${SOURCE_REPO}.git" "$SHA"
           # Vendored references are never reviewed, so they never reach the build.
-          sparse-checkout: |
-            /*
-            !/.repos/
-          sparse-checkout-cone-mode: false
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
+          [[ "$(git rev-parse HEAD)" == "$SHA" ]]
 
       - uses: ./.github/actions/setup-ci-deps
         with:
