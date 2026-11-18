@@ -71,7 +71,10 @@ jobs:
 
           base="$(curl -fsSL -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github.raw" \
             "https://api.github.com/repos/${SOURCE_REPO}/contents/apps/server/package.json?ref=${sha}" | jq -r .version)"
-          version="${base}-vetted.${GITHUB_RUN_NUMBER}"
+          # package.json holds the last stable release; upstream nightlies build the next patch
+          # (scripts/resolve-nightly-release.ts), so 0.1.8 on main ships as 0.1.9-nightly.*.
+          [[ "$base" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([-+].*)?$ ]] || { echo "::error::Unexpected version $base"; exit 1; }
+          version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))-vetted.${GITHUB_RUN_NUMBER}"
           release_tag="vetted-${sha:0:12}"
 
           skip=false
