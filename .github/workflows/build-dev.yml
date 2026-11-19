@@ -1,0 +1,255 @@
+name: Build UNAPPROVED dev T3 Code
+run-name: UNAPPROVED dev build of DEV head
+
+# Builds the head of the DEV branch of the private fork. DEV has not passed
+# vet.sh, so nothing here is a vetted build:
+#   - it never reads or writes an audited/* tag and never publishes a release,
+#     so the desktop updater of a vetted install cannot see it;
+#   - it has no access to the Android signing key and requests no write token;
+#   - its only outputs are workflow artifacts named UNAPPROVED-dev-*, which expire.
+# build.yml stays the only way to a vetted release and is not changed by this file.
+# The build steps mirror build.yml; change both together.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: petervas8/t3code-vetted
+  SOURCE_BRANCH: DEV
+
+jobs:
+  resolve:
+    name: Resolve DEV head
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      version: ${{ steps.r.outputs.version }}
+      label: ${{ steps.r.outputs.label }}
+      audited: ${{ steps.r.outputs.audited }}
+    steps:
+      - id: r
+        env:
+          TOKEN: ${{ secrets.VETTED_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TOKEN" ]]; then
+            echo "::error::Add the VETTED_REPO_TOKEN secret (read access to $SOURCE_REPO). See README.md."
+            exit 1
+          fi
+          refs="$(git ls-remote "https://x-access-token:${TOKEN}@github.com/${SOURCE_REPO}.git" "refs/heads/${SOURCE_BRANCH}" 'refs/tags/audited/*')"
+          sha="$(awk -v r="refs/heads/${SOURCE_BRANCH}" '$2 == r { print $1 }' <<<"$refs")"
+          [[ -n "$sha" ]] || { echo "::error::No branch $SOURCE_BRANCH in $SOURCE_REPO"; exit 1; }
+          # Informational only: an audited tag on this commit does not make this build a vetted one.
+          audited="$(awk -v h="$sha" '$1 == h && $2 ~ /^refs\/tags\/audited\/.*\^\{\}$/ { sub(/^refs\/tags\//, "", $2); sub(/\^\{\}$/, "", $2); print $2; exit }' <<<"$refs")"
+
+          base="$(curl -fsSL -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${SOURCE_REPO}/contents/apps/server/package.json?ref=${sha}" | jq -r .version)"
+          [[ "$base" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([-+].*)?$ ]] || { echo "::error::Unexpected version $base"; exit 1; }
+          # "dev" sorts before "vetted", so a dev build never looks newer than a vetted build of the same base.
+          version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))-dev.${GITHUB_RUN_NUMBER}"
+          label="UNAPPROVED-dev-${sha:0:12}"
+
+          {
+            echo "sha=$sha"; echo "version=$version"; echo "label=$label"; echo "audited=$audited"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## UNAPPROVED development build"
+            echo
+            echo "Building \`$SOURCE_BRANCH\` head \`$sha\` as \`$version\`. This is not a vetted release."
+            if [[ -n "$audited" ]]; then
+              echo
+              echo "The same commit carries \`$audited\`; the vetted build of it is the release \`vetted-${sha:0:12}\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  bundle:
+    name: JS bundle
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      T3CODE_TELEMETRY_CHANNEL: dev
+    steps:
+      # Plain git, as in build.yml. The token is only on this fetch's command line.
+      - &checkout
+        name: Checkout DEV source
+        env:
+          TOKEN: ${{ secrets.VETTED_REPO_TOKEN }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init -q .
+          git fetch -q --no-tags --depth=1 "https://x-access-token:${TOKEN}@github.com/${SOURCE_REPO}.git" "$SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
+          [[ "$(git rev-parse HEAD)" == "$SHA" ]]
+
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - run: vp run build:desktop:bundle
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  linux:
+    name: Linux x64 desktop + server (UNAPPROVED)
+    needs: [resolve, bundle]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      T3CODE_TELEMETRY_CHANNEL: dev
+    steps:
+      - *checkout
+
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - &download_bundle
+        name: Download JS bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: js-bundle
+          path: apps
+
+      - name: Install build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev pkg-config libgtk-3-0t64 libnss3 libasound2t64 libgbm1 imagemagick patchelf
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build resource monitor
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
+
+      - run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
+
+      - name: Build server executable
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Build server archive
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/cli-resource-monitor/linux-x64"
+          mkdir -p "$dir"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$dir/"
+          node scripts/build-cli-archive.ts \
+            --platform linux --arch x64 --version "$VERSION" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
+            --output-dir release-cli
+
+      - name: Smoke-test server archive
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$VERSION"
+
+      - name: Build desktop app
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+        run: vp run dist:desktop:artifact --platform linux --target AppImage --arch x64 --build-version "$VERSION" --skip-build --verbose
+
+      # Installers and the server archive only. The updater metadata (*.yml, *.blockmap)
+      # is left out, so these files cannot serve as an update feed.
+      - &collect
+        name: Collect assets
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+          AUDITED: ${{ needs.resolve.outputs.audited }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p out
+          for f in release/*.dmg release/*.AppImage release/*.deb release-cli/*; do
+            cp "$f" out/
+          done
+          {
+            echo "UNAPPROVED DEVELOPMENT BUILD of T3 Code $VERSION"
+            echo
+            echo "Source:  $SOURCE_REPO, branch $SOURCE_BRANCH, commit $SHA"
+            echo "Built:   $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "This is not a vetted release. The DEV branch has not passed the vet.sh"
+            echo "security gate. Do not treat these files as a trusted build, and do not"
+            echo "pass them on. Vetted builds are the releases named vetted-<sha12>."
+            if [[ -n "$AUDITED" ]]; then
+              echo
+              echo "Note: this commit also carries $AUDITED. The vetted build of it is the"
+              echo "release vetted-${SHA:0:12}, not this artifact."
+            fi
+          } > out/UNAPPROVED-DEV-BUILD.txt
+          (cd out && shasum -a 256 -- * > SHA256SUMS)
+          ls -la out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ needs.resolve.outputs.label }}-linux-x64
+          path: out/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  macos:
+    name: macOS arm64 desktop (UNAPPROVED)
+    needs: [resolve, bundle]
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      T3CODE_TELEMETRY_CHANNEL: dev
+    steps:
+      - *checkout
+
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - *download_bundle
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Build resource monitor
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target aarch64-apple-darwin
+
+      - name: Build desktop app
+        env:
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+        run: vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --build-version "$VERSION" --skip-build --verbose
+
+      - *collect
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ needs.resolve.outputs.label }}-mac-arm64
+          path: out/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

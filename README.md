@@ -2,7 +2,7 @@
 
 Builds audited commits of `petervas8/t3code-vetted` on throwaway GitHub runners, so `pnpm install` and build scripts never run on your machine. This repository holds only the workflow; Actions stay disabled on the vetted fork.
 
-Each run builds one `audited/*` tag and publishes a release named `vetted-<sha12>`:
+Each run of `build.yml` builds one `audited/*` tag and publishes a release named `vetted-<sha12>`:
 
 | Asset | What it is |
 |---|---|
@@ -36,6 +36,23 @@ gh workflow run build.yml -R petervas8/t3code-vet-ci -f force=true            # 
 ```
 
 A run fails at the start if the head of `vetted` has no `audited/*` tag. It skips a commit that already has a release unless you pass `force`.
+
+## Unapproved DEV builds
+
+`build-dev.yml` builds the head of the `DEV` branch of the fork, for trying work that has not passed `vet.sh`. It is a separate workflow so that `build.yml` stays the only way to a vetted release.
+
+```bash
+gh workflow run build-dev.yml -R petervas8/t3code-vet-ci
+gh run download <run-id> -R petervas8/t3code-vet-ci -p 'UNAPPROVED-dev-*'
+```
+
+- **Not a vetted build.** It reads no `audited/*` tag and checks no gate. Versions end in `-dev.<run>`, artifacts are named `UNAPPROVED-dev-<sha12>-*`, and each holds an `UNAPPROVED-DEV-BUILD.txt` naming the commit.
+- **No release.** The files are workflow artifacts that expire after 14 days. A vetted install's updater only follows releases, so it never sees them. The updater metadata is left out of the artifacts.
+- **No signing key.** There is no Android build, and the workflow asks for no write token. It builds the Linux desktop app, the Linux server and the macOS app.
+- **A DEV desktop app still follows this repository's releases**, so it replaces itself with the next vetted release. Set `T3CODE_DISABLE_AUTO_UPDATE=1` to keep it on the DEV build.
+- Run a DEV server with its own `T3CODE_HOME` and port, next to the vetted one, not in place of it.
+
+The build steps are a copy of `build.yml`. Change both together.
 
 ## Installing
 
