@@ -1,8 +1,8 @@
 # t3code-vet-ci
 
-Builds audited commits of `petervas8/t3code-vetted` on throwaway GitHub runners, so `pnpm install` and build scripts never run on your machine. This repository holds only the workflow; Actions stay disabled on the vetted fork.
+Builds `petervas8/t3code-vetted` on throwaway GitHub runners, so `pnpm install` and build scripts never run on your machine. This repository holds only the workflow; Actions stay disabled on the fork.
 
-Each run of `build.yml` builds one `audited/*` tag and publishes a release named `vetted-<sha12>`:
+Each run of `build.yml` builds the fork's `main` branch: its own code on top of `vetted`, the upstream code `vet.sh` approved. The run fails if `main` contains an upstream commit that `vetted` lacks. It publishes a release named `vetted-<sha12>` (the name and the `-vetted.<run>` versions are kept so installed apps keep updating):
 
 | Asset | What it is |
 |---|---|
@@ -27,32 +27,15 @@ Each run of `build.yml` builds one `audited/*` tag and publishes a release named
 
 ## Running a build
 
-`vet.sh approve` and `vet.sh retag` start a build after they push the tag. To start one by hand:
+`.vet/sync.sh` starts a build each time it updates `main`. To start one by hand, for example after pushing your own commits to `main`:
 
 ```bash
-gh workflow run build.yml -R petervas8/t3code-vet-ci                          # audited head of vetted
-gh workflow run build.yml -R petervas8/t3code-vet-ci -f tag=audited/<sha12>   # a specific tag
-gh workflow run build.yml -R petervas8/t3code-vet-ci -f force=true            # rebuild an existing release
+gh workflow run build.yml -R petervas8/t3code-vet-ci                  # head of main
+gh workflow run build.yml -R petervas8/t3code-vet-ci -f ref=<sha>     # a commit on main
+gh workflow run build.yml -R petervas8/t3code-vet-ci -f force=true    # rebuild an existing release
 ```
 
-A run fails at the start if the head of `vetted` has no `audited/*` tag. It skips a commit that already has a release unless you pass `force`.
-
-## Unapproved DEV builds
-
-`build-dev.yml` builds the head of the `DEV` branch of the fork, for trying work that has not passed `vet.sh`. It is a separate workflow so that `build.yml` stays the only way to a vetted release.
-
-```bash
-gh workflow run build-dev.yml -R petervas8/t3code-vet-ci
-gh run download <run-id> -R petervas8/t3code-vet-ci -p 'UNAPPROVED-dev-*'
-```
-
-- **Not a vetted build.** It reads no `audited/*` tag and checks no gate. Versions end in `-dev.<run>`, artifacts are named `UNAPPROVED-dev-<sha12>-*`, and each holds an `UNAPPROVED-DEV-BUILD.txt` naming the commit.
-- **No release.** The files are workflow artifacts that expire after 14 days. A vetted install's updater only follows releases, so it never sees them. The updater metadata is left out of the artifacts.
-- **No signing key.** There is no Android build, and the workflow asks for no write token. It builds the Linux desktop app, the Linux server and the macOS app.
-- **A DEV desktop app still follows this repository's releases**, so it replaces itself with the next vetted release. Set `T3CODE_DISABLE_AUTO_UPDATE=1` to keep it on the DEV build.
-- Run a DEV server with its own `T3CODE_HOME` and port, next to the vetted one, not in place of it.
-
-The build steps are a copy of `build.yml`. Change both together.
+A run skips a commit that already has a release unless you pass `force`.
 
 ## Installing
 
@@ -70,4 +53,4 @@ The build steps are a copy of `build.yml`. Change both together.
 
 ## Visibility
 
-This repository is public, so its releases, workflow logs and the audited commit SHAs are public too. Standard runners are free for public repositories, macOS included. The source stays in the private fork; only the built apps are published here.
+This repository is public, so its releases, workflow logs and the built commit SHAs are public too. Standard runners are free for public repositories, macOS included. The source stays in the private fork; only the built apps are published here.

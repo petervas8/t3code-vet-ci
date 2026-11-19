@@ -1,15 +1,15 @@
-name: Build vetted T3 Code
-run-name: Build ${{ inputs.tag || 'vetted head' }}
+name: Build T3 Code
+run-name: Build ${{ inputs.ref || 'main head' }}
 
-# Builds an audited/* tag of the private vetted fork and publishes one release
-# here. Upstream workflows never run: this repository holds only this file, and
-# Actions stay disabled on the fork.
+# Builds the fork's `main` branch (its own code on top of `vetted`, the upstream
+# code vet.sh approved) and publishes one release here. Upstream workflows never
+# run: this repository holds only this file, and Actions stay disabled on the fork.
 
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: "audited/<sha12> tag to build. Empty builds the audited head of `vetted`."
+      ref:
+        description: "Commit on `main` to build. Empty builds the head of `main`."
         required: false
         type: string
       force:
@@ -19,7 +19,7 @@ on:
         type: boolean
 
 concurrency:
-  group: build-${{ inputs.tag || 'head' }}
+  group: build-${{ inputs.ref || 'head' }}
   cancel-in-progress: false
 
 permissions:
@@ -27,15 +27,17 @@ permissions:
 
 env:
   SOURCE_REPO: petervas8/t3code-vetted
+  SOURCE_BRANCH: main
+  UPSTREAM_REPO: pingdotgg/t3code
 
 jobs:
   resolve:
-    name: Resolve audited commit
+    name: Resolve commit
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.r.outputs.sha }}
-      tag: ${{ steps.r.outputs.tag }}
+      vetted: ${{ steps.r.outputs.vetted }}
       version: ${{ steps.r.outputs.version }}
       release_tag: ${{ steps.r.outputs.release_tag }}
       skip: ${{ steps.r.outputs.skip }}
@@ -43,7 +45,7 @@ jobs:
       - id: r
         env:
           TOKEN: ${{ secrets.VETTED_REPO_TOKEN }}
-          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_REF: ${{ inputs.ref }}
           FORCE: ${{ inputs.force }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -52,22 +54,30 @@ jobs:
             echo "::error::Add the VETTED_REPO_TOKEN secret (read access to $SOURCE_REPO). See README.md."
             exit 1
           fi
-          refs="$(git ls-remote "https://x-access-token:${TOKEN}@github.com/${SOURCE_REPO}.git" refs/heads/vetted 'refs/tags/audited/*')"
+          # Commits only, no trees or blobs: enough to see where main's upstream code came from.
+          # The token is in this throwaway directory's config; this job runs no source code.
+          git init -q "$RUNNER_TEMP/graph" && cd "$RUNNER_TEMP/graph"
+          git remote add src "https://x-access-token:${TOKEN}@github.com/${SOURCE_REPO}.git"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch -q --filter=tree:0 --no-tags src "+refs/heads/${SOURCE_BRANCH}:refs/remotes/src/${SOURCE_BRANCH}" \
+            "+refs/heads/vetted:refs/remotes/src/vetted"
+          git fetch -q --filter=tree:0 --no-tags upstream "+refs/heads/main:refs/remotes/upstream/main"
 
-          # vet.sh makes annotated tags, so each one has a peeled ^{} line naming its commit.
-          if [[ -n "$INPUT_TAG" ]]; then
-            tag="${INPUT_TAG#refs/tags/}"
-            [[ "$tag" == audited/* ]] || { echo "::error::$tag is not an audited/* tag"; exit 1; }
-            sha="$(awk -v r="refs/tags/${tag}^{}" '$2 == r { print $1 }' <<<"$refs")"
-            [[ -n "$sha" ]] || { echo "::error::No annotated tag $tag in $SOURCE_REPO"; exit 1; }
+          if [[ -n "$INPUT_REF" ]]; then
+            sha="$(git rev-parse --verify "${INPUT_REF}^{commit}")" || { echo "::error::Unknown commit $INPUT_REF"; exit 1; }
+            git merge-base --is-ancestor "$sha" "src/$SOURCE_BRANCH" || { echo "::error::$INPUT_REF is not on $SOURCE_BRANCH"; exit 1; }
           else
-            sha="$(awk '$2 == "refs/heads/vetted" { print $1 }' <<<"$refs")"
-            tag="$(awk -v h="$sha" '$1 == h && $2 ~ /^refs\/tags\/audited\/.*\^\{\}$/ { sub(/^refs\/tags\//, "", $2); sub(/\^\{\}$/, "", $2); print $2; exit }' <<<"$refs")"
-            if [[ -z "$tag" ]]; then
-              echo "::error::vetted head ${sha:0:12} carries no audited/* tag. Run vet.sh approve or vet.sh retag first."
-              exit 1
-            fi
+            sha="$(git rev-parse "src/$SOURCE_BRANCH")"
           fi
+          vetted="$(git rev-parse src/vetted)"
+
+          # Upstream code reaches main only through vetted, which moves only through vet.sh approve.
+          unvetted="$(git rev-list "$sha" ^src/vetted | grep -Fxf <(git rev-list upstream/main ^src/vetted) || true)"
+          if [[ -n "$unvetted" ]]; then
+            echo "::error::${SOURCE_BRANCH} at ${sha:0:12} has $(wc -l <<<"$unvetted") upstream commit(s) that vetted lacks, for example $(head -n1 <<<"$unvetted"). Bring upstream in through vet.sh."
+            exit 1
+          fi
+          cd - >/dev/null; rm -rf "$RUNNER_TEMP/graph"
 
           base="$(curl -fsSL -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github.raw" \
             "https://api.github.com/repos/${SOURCE_REPO}/contents/apps/server/package.json?ref=${sha}" | jq -r .version)"
@@ -84,10 +94,10 @@ jobs:
           fi
 
           {
-            echo "sha=$sha"; echo "tag=$tag"; echo "version=$version"
+            echo "sha=$sha"; echo "vetted=$vetted"; echo "version=$version"
             echo "release_tag=$release_tag"; echo "skip=$skip"
           } >> "$GITHUB_OUTPUT"
-          echo "Building $tag ($sha) as $version" >> "$GITHUB_STEP_SUMMARY"
+          echo "Building $SOURCE_BRANCH at $sha (vetted ${vetted:0:12}) as $version" >> "$GITHUB_STEP_SUMMARY"
 
   # Server bundle, web client and Electron main. Platform independent, so the
   # desktop jobs share it.
@@ -105,7 +115,7 @@ jobs:
       # foreach that fails on the orphaned gitlinks under .repos/. The token is
       # only on this fetch's command line and never lands in git config.
       - &checkout
-        name: Checkout audited source
+        name: Checkout source
         env:
           TOKEN: ${{ secrets.VETTED_REPO_TOKEN }}
           SHA: ${{ needs.resolve.outputs.sha }}
@@ -373,7 +383,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
-          AUDITED_TAG: ${{ needs.resolve.outputs.tag }}
+          VETTED: ${{ needs.resolve.outputs.vetted }}
           SHA: ${{ needs.resolve.outputs.sha }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
@@ -384,4 +394,4 @@ jobs:
           fi
           gh release create "$RELEASE_TAG" assets/* -R "$GITHUB_REPOSITORY" \
             --title "T3 Code $VERSION" \
-            --notes "Built from \`$AUDITED_TAG\` ($SHA) of $SOURCE_REPO."
+            --notes "Built from \`$SOURCE_BRANCH\` at $SHA of $SOURCE_REPO. Upstream code: \`vetted\` at ${VETTED:0:12}."
