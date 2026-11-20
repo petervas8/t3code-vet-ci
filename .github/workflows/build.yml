@@ -128,6 +128,12 @@ jobs:
           git sparse-checkout set --no-cone '/*' '!/.repos/'
           git -c checkout.workers=0 checkout -q --detach FETCH_HEAD
           [[ "$(git rev-parse HEAD)" == "$SHA" ]]
+          # T3 Connect's public Clerk and relay identifiers. Without them the apps
+          # never load a cloud session and every T3 Connect route stays pending.
+          cp .env.example .env
+          for key in CLERK_PUBLISHABLE_KEY CLERK_JWT_TEMPLATE CLERK_CLI_OAUTH_CLIENT_ID RELAY_URL; do
+            grep -q "^T3CODE_${key}=." .env || { echo "::error::.env.example lacks T3CODE_${key}"; exit 1; }
+          done
 
       - uses: ./.github/actions/setup-ci-deps
         with:
