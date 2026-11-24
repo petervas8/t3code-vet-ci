@@ -40,6 +40,7 @@ jobs:
       vetted: ${{ steps.r.outputs.vetted }}
       version: ${{ steps.r.outputs.version }}
       release_tag: ${{ steps.r.outputs.release_tag }}
+      existing: ${{ steps.r.outputs.existing }}
       skip: ${{ steps.r.outputs.skip }}
     steps:
       - id: r
@@ -85,17 +86,21 @@ jobs:
           # (scripts/resolve-nightly-release.ts), so 0.1.8 on main ships as 0.1.9-nightly.*.
           [[ "$base" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([-+].*)?$ ]] || { echo "::error::Unexpected version $base"; exit 1; }
           version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))-vetted.${GITHUB_RUN_NUMBER}"
-          release_tag="vetted-${sha:0:12}"
+          # T3 Code downloads release files from releases/download/v<version>/, so the tag is
+          # v<version>. A commit's earlier builds are found by its full SHA in their notes.
+          release_tag="v${version}"
+          existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq ".[] | select((.body // \"\") | contains(\"${sha}\")) | .tag_name")"
 
           skip=false
-          if gh release view "$release_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [[ "$FORCE" != true ]]; then
-            echo "::notice::$release_tag is already released. Run with force to rebuild."
+          if [[ -n "$existing" && "$FORCE" != true ]]; then
+            echo "::notice::${sha:0:12} is already released as $(head -n 1 <<<"$existing"). Run with force to rebuild."
             skip=true
           fi
 
           {
             echo "sha=$sha"; echo "vetted=$vetted"; echo "version=$version"
-            echo "release_tag=$release_tag"; echo "skip=$skip"
+            echo "release_tag=$release_tag"; echo "existing=$(tr '\n' ' ' <<<"$existing")"; echo "skip=$skip"
           } >> "$GITHUB_OUTPUT"
           echo "Building $SOURCE_BRANCH at $sha (vetted ${vetted:0:12}) as $version" >> "$GITHUB_STEP_SUMMARY"
 
@@ -389,15 +394,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          EXISTING: ${{ needs.resolve.outputs.existing }}
           VETTED: ${{ needs.resolve.outputs.vetted }}
           SHA: ${{ needs.resolve.outputs.sha }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
           (cd assets && sha256sum * > SHA256SUMS)
-          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release delete "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes
-          fi
+          for old in $EXISTING; do
+            gh release delete "$old" -R "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          done
           gh release create "$RELEASE_TAG" assets/* -R "$GITHUB_REPOSITORY" \
             --title "T3 Code $VERSION" \
             --notes "Built from \`$SOURCE_BRANCH\` at $SHA of $SOURCE_REPO. Upstream code: \`vetted\` at ${VETTED:0:12}."

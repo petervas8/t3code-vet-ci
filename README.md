@@ -2,7 +2,7 @@
 
 Builds `petervas8/t3code-vetted` on throwaway GitHub runners, so `pnpm install` and build scripts never run on your machine. This repository holds only the workflow; Actions stay disabled on the fork.
 
-Each run of `build.yml` builds the fork's `main` branch: its own code on top of `vetted`, the upstream code `vet.sh` approved. The run fails if `main` contains an upstream commit that `vetted` lacks. It publishes a release named `vetted-<sha12>` (the name and the `-vetted.<run>` versions are kept so installed apps keep updating):
+Each run of `build.yml` builds the fork's `main` branch: its own code on top of `vetted`, the upstream code `vet.sh` approved. The run fails if `main` contains an upstream commit that `vetted` lacks. It publishes a release tagged `v<version>`, for example `v0.1.12-vetted.11`. The vetted app downloads its SSH server archive and `t3 update` releases from that tag, and the `-vetted.<run>` versions only grow, so installed apps keep updating:
 
 | Asset | What it is |
 |---|---|
@@ -45,7 +45,7 @@ A run skips a commit that already has a release unless you pass `force`.
 
 ## Things that still reach upstream
 
-- **`t3 update`, and Update server in the mobile app**, install upstream's unvetted release from `pingdotgg/t3code`. Don't use them. Install the next build from here instead.
+- **`t3 update`, Update server in the mobile app, and SSH connections** download servers from this repository's releases, not upstream. Only `linux-x64` server archives are built, so they work only on Linux x64 hosts.
 - **Desktop auto-update** follows releases in this repository, not upstream, so it only installs vetted builds. The Linux AppImage updates itself. macOS can't install updates into an app that isn't signed with a Developer ID, so download new DMGs by hand.
 - **Over-the-air mobile updates** are turned off at build time (`T3CODE_MOBILE_UPDATES_ENABLED=0`). Without that, the APK would download JS from upstream's Expo project on every launch.
 - **Telemetry** can only be turned off at runtime: `T3CODE_TELEMETRY_ENABLED=false`.
