@@ -148,6 +148,11 @@ jobs:
 
       - run: vp run build:desktop:bundle
 
+      # upload-artifact skips hidden paths, so carry the web asset manifest
+      # under a visible name (upstream #42806); jobs restore it after download.
+      - name: Stage web asset manifest
+        run: cp apps/server/dist/client/.vite/manifest.json apps/server/dist/client/vite-manifest.release.json
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: js-bundle
@@ -180,6 +185,13 @@ jobs:
         with:
           name: js-bundle
           path: apps
+
+      - &restore_manifest
+        name: Restore web asset manifest
+        run: |
+          client=apps/server/dist/client
+          mkdir -p "$client/.vite"
+          mv "$client/vite-manifest.release.json" "$client/.vite/manifest.json"
 
       - name: Install build libraries
         run: |
@@ -241,7 +253,8 @@ jobs:
   macos:
     name: macOS arm64 desktop
     needs: [resolve, bundle]
-    runs-on: macos-15
+    # The Apple Speech helper (upstream #34027) needs Xcode 26.
+    runs-on: macos-26
     timeout-minutes: 45
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
@@ -256,6 +269,8 @@ jobs:
       - run: node scripts/update-release-package-versions.ts "$VERSION"
 
       - *download_bundle
+
+      - *restore_manifest
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
